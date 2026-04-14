@@ -136,8 +136,10 @@ services:
     depends_on:
       appointment-db:
         condition: service_healthy
+      # RabbitMQ can briefly report unhealthy during boot/recovery on Docker Desktop.
+      # Start the service and let app-level reconnect handle broker readiness.
       rabbitmq:
-        condition: service_healthy
+        condition: service_started
 
   telemedicine-service:
     build: ./services/telemedicine-service
