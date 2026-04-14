@@ -1,0 +1,224 @@
+# Mongo healthcheck: avoid mongosh here — each check spawns a Node process; on Docker Desktop that can leave
+# zombies and block "docker compose up" / recreate ("cannot stop container ... zombie ... Use --init").
+# TCP to 27017 is enough for depends_on: service_healthy once mongod is listening.
+x-mongo-healthcheck: &mongo-healthcheck
+  test:
+    [
+      "CMD",
+      "bash",
+      "-c",
+      "timeout 5 bash -c 'exec 3<>/dev/tcp/127.0.0.1/27017' || exit 1",
+    ]
+  interval: 20s
+  timeout: 10s
+  retries: 45
+  # Unclean shutdown + Docker Desktop / slow disk can keep mongod off :27017 for many minutes
+  # (WiredTiger recovery). Keep this well above worst-case so Compose does not give up early.
+  start_period: 1200s
+
+# init: true = PID 1 reaps stray child processes; keeps stop/recreate reliable on Windows Docker Desktop.
+x-mongo-db: &mongo-db
+  image: mongo:7
+  init: true
+  stop_grace_period: 90s
+  restart: unless-stopped
+  healthcheck: *mongo-healthcheck
+
+services:
+  rabbitmq:
+    # No init: — docker-init + Erlang VM often causes exit 1 / Restarting on Docker Desktop.
+    # Stable hostname matches Mnesia data; if you change hostname, remove the rabbitmq volume once (see README_MICROSERVICES).
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    hostname: rabbitmq
+    restart: unless-stopped
+    stop_grace_period: 90s
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 25s
+      timeout: 60s
+      retries: 45
+      start_period: 600s
+
+  auth-db:
+    <<: *mongo-db
+    container_name: auth-db
+    ports:
+      - "27021:27017"
+
+  patient-db:
+    <<: *mongo-db
+    container_name: patient-db
+    ports:
+      - "27022:27017"
+
+  doctor-db:
+    <<: *mongo-db
+    container_name: doctor-db
+    ports:
+      - "27023:27017"
+
+  appointment-db:
+    <<: *mongo-db
+    container_name: appointment-db
+    ports:
+      - "27024:27017"
+
+  telemedicine-db:
+    <<: *mongo-db
+    container_name: telemedicine-db
+    ports:
+      - "27025:27017"
+
+  payment-db:
+    <<: *mongo-db
+    container_name: payment-db
+    ports:
+      - "27026:27017"
+
+  notification-db:
+    <<: *mongo-db
+    container_name: notification-db
+    ports:
+      - "27027:27017"
+
+  auth-service:
+    build: ./services/auth-service
+    container_name: auth-service
+    environment:
+      PORT: 4001
+      MONGO_URI: mongodb://auth-db:27017/auth_db
+      JWT_SECRET: shared_microservice_secret
+      DEFAULT_ADMIN_EMAIL: admin@hospital.local
+      DEFAULT_ADMIN_PASSWORD: Admin@123
+      DOCTOR_SERVICE_URL: http://doctor-service:4003
+      INTERNAL_API_SECRET: internal_bootstrap_ds_ass1
+    depends_on:
+      auth-db:
+        condition: service_healthy
+      doctor-service:
+        condition: service_started
+
+  patient-service:
+    build: ./services/patient-service
+    container_name: patient-service
+    environment:
+      PORT: 4002
+      MONGO_URI: mongodb://patient-db:27017/patient_db
+      JWT_SECRET: shared_microservice_secret
+    depends_on:
+      patient-db:
+        condition: service_healthy
+
+  doctor-service:
+    build: ./services/doctor-service
+    container_name: doctor-service
+    environment:
+      PORT: 4003
+      MONGO_URI: mongodb://doctor-db:27017/doctor_db
+      JWT_SECRET: shared_microservice_secret
+      INTERNAL_API_SECRET: internal_bootstrap_ds_ass1
+    depends_on:
+      doctor-db:
+        condition: service_healthy
+
+  appointment-service:
+    build: ./services/appointment-service
+    container_name: appointment-service
+    environment:
+      PORT: 4004
+      MONGO_URI: mongodb://appointment-db:27017/appointment_db
+      JWT_SECRET: shared_microservice_secret
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    depends_on:
+      appointment-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  telemedicine-service:
+    build: ./services/telemedicine-service
+    container_name: telemedicine-service
+    environment:
+      PORT: 4005
+      MONGO_URI: mongodb://telemedicine-db:27017/telemedicine_db
+      JWT_SECRET: shared_microservice_secret
+      JITSI_BASE_URL: https://meet.jit.si
+    depends_on:
+      telemedicine-db:
+        condition: service_healthy
+
+  payment-service:
+    build: ./services/payment-service
+    container_name: payment-service
+    environment:
+      PORT: 4006
+      MONGO_URI: mongodb://payment-db:27017/payment_db
+      JWT_SECRET: shared_microservice_secret
+      APPOINTMENT_SERVICE_URL: http://appointment-service:4004
+    depends_on:
+      payment-db:
+        condition: service_healthy
+      appointment-service:
+        condition: service_started
+
+  notification-service:
+    build: ./services/notification-service
+    container_name: notification-service
+    restart: unless-stopped
+    # Load provider secrets from .env next to this compose file. Using env_file avoids
+    # empty ${VAR:-} interpolation (e.g. wrong compose CWD) wiping Twilio/Resend in the container.
+    env_file:
+      - .env
+    environment:
+      PORT: 4007
+      MONGO_URI: mongodb://notification-db:27017/notification_db
+      JWT_SECRET: shared_microservice_secret
+      RABBITMQ_URL: amqp://rabbitmq:5672
+    # service_started: Mongo/RabbitMQ can take many minutes after unclean shutdown (WiredTiger recovery).
+    # notification-service retries Mongo in-process so `compose up` is not blocked on health: healthy.
+    depends_on:
+      notification-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_started
+
+  ai-service:
+    build: ./services/ai-service
+    container_name: ai-service
+    environment:
+      PORT: 4008
+      JWT_SECRET: shared_microservice_secret
+
+  api-gateway:
+    build: ./gateway
+    container_name: api-gateway
+    restart: unless-stopped
+    # Host 8080 is often already taken (IIS, Java, other tools). Use 8081 by default.
+    # To use 8080 instead: create a `.env` in this folder with GATEWAY_HOST_PORT=8080
+    ports:
+      - "${GATEWAY_HOST_PORT:-8081}:8080"
+    environment:
+      PORT: 8080
+      JWT_SECRET: shared_microservice_secret
+      INTERNAL_API_SECRET: internal_bootstrap_ds_ass1
+      AUTH_SERVICE_URL: http://auth-service:4001
+      PATIENT_SERVICE_URL: http://patient-service:4002
+      DOCTOR_SERVICE_URL: http://doctor-service:4003
+      APPOINTMENT_SERVICE_URL: http://appointment-service:4004
+      TELEMEDICINE_SERVICE_URL: http://telemedicine-service:4005
+      PAYMENT_SERVICE_URL: http://payment-service:4006
+      NOTIFICATION_SERVICE_URL: http://notification-service:4007
+      AI_SERVICE_URL: http://ai-service:4008
+    depends_on:
+      - auth-service
+      - patient-service
+      - doctor-service
+      - appointment-service
+      - telemedicine-service
+      - payment-service
+      - notification-service
+      - ai-service
