@@ -1,0 +1,24 @@
+# External HTTP access to the API Gateway (Minikube: enable ingress addon).
+# Usage: add to hosts → $(minikube ip) hospital-api.local
+#   kubectl apply -f k8s-microservices/all-in-one.yaml
+#   kubectl apply -f k8s-microservices/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hospital-api-ingress
+  namespace: hospital-ms
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: hospital-api.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-gateway
+                port:
+                  number: 8080
